@@ -1,14 +1,25 @@
 # ===== 阶段 1: 用 Go 构建可执行文件 =====
-FROM golang:1.23 AS go-builder
+# 不直接拉 golang 镜像（国内易超时），在 ubuntu 里装官方 Go 包再编译
+FROM ubuntu:22.04 AS go-builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/go/bin:$PATH \
+    GOPROXY=https://goproxy.cn,direct
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git \
+    && curl -fsSL -o /tmp/go.tgz https://golang.google.cn/dl/go1.23.6.linux-amd64.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm -rf /tmp/go.tgz /var/lib/apt/lists/*
+
 # 克隆并编译 apple-music-downloader
-RUN git clone https://github.com/zhaarey/apple-music-downloader.git \
+RUN git clone --depth 1 https://github.com/zhaarey/apple-music-downloader.git \
     && cd apple-music-downloader \
     && go mod download \
     && go build -o amd main.go \
-    && chmod +x amd 
+    && chmod +x amd
 
 # ===== 阶段 2: Python 程序运行环境 =====
 
@@ -128,7 +139,7 @@ RUN mkdir -p /downloads/x /downloads/youtube \
 
 # 设置健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/ || exit 1
+    CMD curl -f http://localhost:8530/ || exit 1
 
 # 设置入口点
 ENTRYPOINT ["python3", "main.py"]

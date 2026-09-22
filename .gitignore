@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 本地数据 / 运行产物
+data/
+downloads/
+cookies/
+logs/
+db/
+cache/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Docker 导出镜像
+*.tar
+*.tar.gz
+savextube-web.tar*
+
+# 环境 / 密钥（保留示例配置可自行加 exception）
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+session*.session
+*.session-journal
+
+# IDE / 系统
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 其它本地杂项
+*.toml.bak
+agent-transcripts/

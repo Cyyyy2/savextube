@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SaveXTube</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2a3544;
+      --text: #e7ecf3;
+      --muted: #8b9bb0;
+      --accent: #3d8bfd;
+      --accent-hover: #5c9fff;
+      --ok: #3dd68c;
+      --warn: #f5a524;
+      --err: #f31260;
+      --track: #243044;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(1200px 600px at 10% -10%, #1b3a5f 0%, transparent 55%),
+        radial-gradient(900px 500px at 100% 0%, #1a2f28 0%, transparent 50%),
+        var(--bg);
+      color: var(--text);
+    }
+    .wrap {
+      width: min(860px, calc(100% - 32px));
+      margin: 48px auto 64px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.75rem;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+    }
+    .sub {
+      margin: 0 0 28px;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.55;
+    }
+    .card {
+      background: color-mix(in srgb, var(--panel) 92%, black);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    label {
+      display: block;
+      font-size: 0.85rem;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    input[type="password"],
+    input[type="text"],
+    textarea {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: #121a24;
+      color: var(--text);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 1rem;
+      outline: none;
+    }
+    input:focus, textarea:focus {
+      border-color: var(--accent);
+    }
+    textarea {
+      min-height: 96px;
+      resize: vertical;
+      line-height: 1.45;
+    }
+    .row {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    .row.center {
+      justify-content: stretch;
+    }
+    .row.center button {
+      flex: 1;
+      min-width: 140px;
+    }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 18px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+    }
+    button:hover { background: var(--accent-hover); }
+    button.secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button.success {
+      background: #1f9d66;
+    }
+    button.success:hover {
+      background: #27b678;
+    }
+    button.danger {
+      background: transparent;
+      color: var(--err);
+      border: 1px solid color-mix(in srgb, var(--err) 45%, var(--border));
+    }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    .hint {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+    .error {
+      margin-top: 10px;
+      color: var(--err);
+      font-size: 0.9rem;
+    }
+    .hidden { display: none !important; }
+    .preview-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      margin-bottom: 14px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .preview-meta strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+    .preview-media video {
+      width: 100%;
+      max-height: 480px;
+      border-radius: 12px;
+      background: #000;
+      display: block;
+    }
+    .preview-gallery {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px;
+    }
+    .preview-gallery img {
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      border-radius: 10px;
+      background: #121a24;
+      border: 1px solid var(--border);
+      cursor: zoom-in;
+    }
+    .preview-gallery img:hover {
+      border-color: var(--accent);
+    }
+    .lightbox {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.86);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      padding: 24px;
+    }
+    .lightbox img {
+      max-width: min(960px, 100%);
+      max-height: 90vh;
+      border-radius: 8px;
+    }
+    .task {
+      border-top: 1px solid var(--border);
+      padding: 14px 0 4px;
+    }
+    .task:first-child { border-top: 0; padding-top: 0; }
+    .task-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .task-url {
+      word-break: break-all;
+      font-size: 0.92rem;
+    }
+    .badge {
+      flex-shrink: 0;
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .badge.downloading, .badge.queued { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+    .badge.completed { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+    .badge.failed, .badge.cancelled { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+    .meta {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    .bar {
+      margin-top: 10px;
+      height: 8px;
+      background: var(--track);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .bar > span {
+      display: block;
+      height: 100%;
+      width: 0;
+      background: linear-gradient(90deg, #2f6fed, #4db6ac);
+      transition: width 0.25s ease;
+    }
+    .empty {
+      color: var(--muted);
+      font-size: 0.95rem;
+      padding: 8px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>SaveXTube</h1>
+    <p class="sub">粘贴链接后先「开始解析」预览内容，确认后再「一键下载」保存到服务器 downloads 目录。</p>
+
+    <section id="loginCard" class="card">
+      <label for="tokenInput">访问 Token</label>
+      <input id="tokenInput" type="password" autocomplete="current-password" placeholder="输入 web_auth_token" />
+      <div class="row">
+        <button id="loginBtn" type="button">进入</button>
+      </div>
+      <p class="hint">Token 保存在本机浏览器，不会发给第三方。</p>
+      <p id="loginError" class="error hidden"></p>
+    </section>
+
+    <section id="appCard" class="card hidden">
+      <label for="urlInput">请输入 URL 地址</label>
+      <textarea id="urlInput" placeholder="粘贴抖音 / 小红书 / B站 / YouTube 等分享链接…"></textarea>
+      <div class="row center">
+        <button id="parseBtn" type="button">开始解析</button>
+        <button id="downloadBtn" class="success" type="button" disabled>一键下载</button>
+      </div>
+      <div class="row">
+        <button id="refreshBtn" class="secondary" type="button">刷新任务</button>
+        <button id="logoutBtn" class="secondary" type="button">退出</button>
+      </div>
+      <p class="hint">解析只取直链并预览，不会立刻下载；一键下载才会写入服务器。</p>
+      <p id="formError" class="error hidden"></p>
+    </section>
+
+    <section id="previewCard" class="card hidden">
+      <label>解析结果</label>
+      <div id="previewMeta" class="preview-meta"></div>
+      <div id="previewMedia" class="preview-media"></div>
+      <p id="previewHint" class="hint hidden"></p>
+    </section>
+
+    <section id="tasksCard" class="card hidden">
+      <label>下载任务</label>
+      <div id="taskList" class="empty">暂无任务</div>
+    </section>
+  </div>
+
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true">
+    <img id="lightboxImg" alt="预览大图" />
+  </div>
+
+  <script>
+    const STORAGE_KEY = "savextube_web_token";
+    const POLL_ACTIVE_MS = 2000;  // 有排队/下载中任务时
+    const POLL_IDLE_MS = 12000;   // 无活动任务时（避免空闲狂刷）
+
+    const loginCard = document.getElementById("loginCard");
+    const appCard = document.getElementById("appCard");
+    const previewCard = document.getElementById("previewCard");
+    const tasksCard = document.getElementById("tasksCard");
+    const tokenInput = document.getElementById("tokenInput");
+    const urlInput = document.getElementById("urlInput");
+    const loginError = document.getElementById("loginError");
+    const formError = document.getElementById("formError");
+    const taskList = document.getElementById("taskList");
+    const previewMeta = document.getElementById("previewMeta");
+    const previewMedia = document.getElementById("previewMedia");
+    const previewHint = document.getElementById("previewHint");
+    const parseBtn = document.getElementById("parseBtn");
+    const downloadBtn = document.getElementById("downloadBtn");
+    const lightbox = document.getElementById("lightbox");
+    const lightboxImg = document.getElementById("lightboxImg");
+
+    let authToken = localStorage.getItem(STORAGE_KEY) || "";
+    let pollTimer = null;
+    let hasActiveTasks = false;
+    let knownIds = new Set();
+    let lastParsedUrl = "";
+
+    function show(el, on) {
+      el.classList.toggle("hidden", !on);
+    }
+
+    function setError(el, msg) {
+      if (!msg) {
+        show(el, false);
+        el.textContent = "";
+        return;
+      }
+      el.textContent = msg;
+      show(el, true);
+    }
+
+    async function api(path, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      if (authToken) headers["Authorization"] = "Bearer " + authToken;
+      if (options.body && !headers["Content-Type"]) {
+        headers["Content-Type"] = "application/json";
+      }
+      const res = await fetch(path, Object.assign({}, options, { headers }));
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = null;
+      }
+      if (!res.ok) {
+        const err = (data && data.error) || ("HTTP " + res.status);
+        const error = new Error(err);
+        error.status = res.status;
+        error.data = data;
+        throw error;
+      }
+      return data;
+    }
+
+    function proxyUrl(mediaUrl) {
+      return (
+        "/api/media-proxy?url=" +
+        encodeURIComponent(mediaUrl) +
+        "&token=" +
+        encodeURIComponent(authToken)
+      );
+    }
+
+    function clearPreview() {
+      lastParsedUrl = "";
+      previewMeta.innerHTML = "";
+      previewMedia.innerHTML = "";
+      setError(previewHint, "");
+      show(previewHint, false);
+      show(previewCard, false);
+      downloadBtn.disabled = true;
+    }
+
+    function renderPreview(result, sourceUrl) {
+      lastParsedUrl = sourceUrl;
+      const title = result.title || "未命名";
+      const author = result.author || "-";
+      const platform = result.platform || "-";
+      const contentType = result.content_type || "-";
+      const media = Array.isArray(result.media) ? result.media : [];
+
+      previewMeta.innerHTML =
+        "<span><strong>平台</strong> " + escapeHtml(platform) + "</span>" +
+        "<span><strong>类型</strong> " + escapeHtml(contentType) + "</span>" +
+        "<span><strong>标题</strong> " + escapeHtml(title) + "</span>" +
+        "<span><strong>作者</strong> " + escapeHtml(author) + "</span>";
+
+      if (!media.length) {
+        previewMedia.innerHTML = '<div class="empty">暂无媒体预览</div>';
+        if (result.message) {
+          previewHint.textContent = result.message;
+          show(previewHint, true);
+        } else {
+          show(previewHint, false);
+        }
+      } else if (contentType === "image" || media.every((m) => m.type === "image")) {
+        previewMedia.innerHTML =
+          '<div class="preview-gallery">' +
+          media
+            .map((m) => {
+              const src = proxyUrl(m.url);
+              return (
+                '<img src="' +
+                escapeHtml(src) +
+                '" alt="图集" data-full="' +
+                escapeHtml(src) +
+                '" loading="lazy" />'
+              );
+            })
+            .join("") +
+          "</div>";
+        show(previewHint, false);
+      } else {
+        const video = media.find((m) => m.type === "video") || media[0];
+        previewMedia.innerHTML =
+          '<video controls playsinline preload="metadata" src="' +
+          escapeHtml(proxyUrl(video.url)) +
+          '"></video>';
+        show(previewHint, false);
+      }
+
+      show(previewCard, true);
+      downloadBtn.disabled = false;
+    }
+
+    function enterApp() {
+      show(loginCard, false);
+      show(appCard, true);
+      show(tasksCard, true);
+      refreshTasks();
+      startPolling();
+    }
+
+    function leaveApp() {
+      stopPolling();
+      authToken = "";
+      localStorage.removeItem(STORAGE_KEY);
+      show(appCard, false);
+      show(tasksCard, false);
+      clearPreview();
+      show(loginCard, true);
+      tokenInput.value = "";
+      taskList.innerHTML = '<div class="empty">暂无任务</div>';
+      knownIds = new Set();
+      hasActiveTasks = false;
+    }
+
+    async function tryLogin(token) {
+      setError(loginError, "");
+      authToken = (token || "").trim();
+      if (!authToken) {
+        setError(loginError, "请输入 Token");
+        return;
+      }
+      try {
+        await api("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ token: authToken }),
+        });
+        localStorage.setItem(STORAGE_KEY, authToken);
+        enterApp();
+      } catch (e) {
+        authToken = "";
+        localStorage.removeItem(STORAGE_KEY);
+        setError(loginError, e.message || "登录失败");
+      }
+    }
+
+    function statusLabel(status) {
+      return {
+        queued: "排队",
+        downloading: "下载中",
+        completed: "完成",
+        failed: "失败",
+        cancelled: "已取消",
+      }[status] || status;
+    }
+
+    function renderTasks(tasks) {
+      if (!tasks || !tasks.length) {
+        taskList.innerHTML = '<div class="empty">暂无任务</div>';
+        knownIds = new Set();
+        return;
+      }
+      knownIds = new Set(tasks.map((t) => t.id));
+      taskList.innerHTML = tasks.map((t) => {
+        const percent = Math.max(0, Math.min(100, Number(t.percent) || 0));
+        const canCancel = t.status === "queued" || t.status === "downloading";
+        const metaParts = [];
+        if (t.filename) metaParts.push(t.filename);
+        if (t.speed) metaParts.push(t.speed);
+        if (t.eta) metaParts.push("剩余 " + t.eta);
+        metaParts.push(percent.toFixed(1) + "%");
+        if (t.message) metaParts.push(t.message);
+        if (t.error) metaParts.push(t.error);
+        return (
+          '<div class="task" data-id="' + t.id + '">' +
+            '<div class="task-top">' +
+              '<div class="task-url">' + escapeHtml(t.url || "") + "</div>" +
+              '<span class="badge ' + escapeHtml(t.status || "") + '">' + escapeHtml(statusLabel(t.status)) + "</span>" +
+            "</div>" +
+            '<div class="bar"><span style="width:' + percent + '%"></span></div>' +
+            '<div class="meta">' + escapeHtml(metaParts.join(" · ")) + "</div>" +
+            (canCancel
+              ? '<div class="row"><button class="danger" type="button" data-cancel="' + t.id + '">取消</button></div>'
+              : "") +
+          "</div>"
+        );
+      }).join("");
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function tasksAreActive(tasks) {
+      return (tasks || []).some((t) => t.status === "queued" || t.status === "downloading");
+    }
+
+    async function refreshTasks() {
+      try {
+        const data = await api("/api/tasks?limit=30");
+        const tasks = data.tasks || [];
+        const active = tasksAreActive(tasks);
+        renderTasks(tasks);
+        setError(formError, "");
+        if (active !== hasActiveTasks) {
+          hasActiveTasks = active;
+          if (pollTimer) startPolling(); // 按活跃状态切换间隔
+        }
+      } catch (e) {
+        if (e.status === 401) {
+          leaveApp();
+          setError(loginError, "登录已失效，请重新输入 Token");
+          return;
+        }
+        setError(formError, e.message || "刷新失败");
+      }
+    }
+
+    function startPolling() {
+      stopPolling();
+      const ms = hasActiveTasks ? POLL_ACTIVE_MS : POLL_IDLE_MS;
+      pollTimer = setInterval(refreshTasks, ms);
+    }
+
+    function stopPolling() {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    }
+
+    document.getElementById("loginBtn").addEventListener("click", () => {
+      tryLogin(tokenInput.value);
+    });
+    tokenInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") tryLogin(tokenInput.value);
+    });
+
+    document.getElementById("logoutBtn").addEventListener("click", leaveApp);
+    document.getElementById("refreshBtn").addEventListener("click", refreshTasks);
+
+    parseBtn.addEventListener("click", async () => {
+      setError(formError, "");
+      const url = (urlInput.value || "").trim();
+      if (!url) {
+        setError(formError, "请粘贴链接");
+        return;
+      }
+      parseBtn.disabled = true;
+      parseBtn.textContent = "解析中…";
+      try {
+        const data = await api("/api/parse", {
+          method: "POST",
+          body: JSON.stringify({ url }),
+        });
+        renderPreview(data.result || {}, url);
+      } catch (e) {
+        clearPreview();
+        setError(formError, e.message || "解析失败");
+      } finally {
+        parseBtn.disabled = false;
+        parseBtn.textContent = "开始解析";
+      }
+    });
+
+    downloadBtn.addEventListener("click", async () => {
+      setError(formError, "");
+      const url = (lastParsedUrl || urlInput.value || "").trim();
+      if (!url) {
+        setError(formError, "请先解析或粘贴链接");
+        return;
+      }
+      downloadBtn.disabled = true;
+      try {
+        await api("/api/download", {
+          method: "POST",
+          body: JSON.stringify({ url }),
+        });
+        hasActiveTasks = true;
+        startPolling();
+        await refreshTasks();
+      } catch (e) {
+        setError(formError, e.message || "提交下载失败");
+      } finally {
+        downloadBtn.disabled = !lastParsedUrl && !(urlInput.value || "").trim();
+      }
+    });
+
+    previewMedia.addEventListener("click", (e) => {
+      const img = e.target.closest("img[data-full]");
+      if (!img) return;
+      lightboxImg.src = img.getAttribute("data-full");
+      show(lightbox, true);
+    });
+    lightbox.addEventListener("click", () => {
+      show(lightbox, false);
+      lightboxImg.removeAttribute("src");
+    });
+
+    taskList.addEventListener("click", async (e) => {
+      const btn = e.target.closest("[data-cancel]");
+      if (!btn) return;
+      const id = btn.getAttribute("data-cancel");
+      btn.disabled = true;
+      try {
+        await api("/api/tasks/" + encodeURIComponent(id) + "/cancel", { method: "POST" });
+        await refreshTasks();
+      } catch (err) {
+        setError(formError, err.message || "取消失败");
+        btn.disabled = false;
+      }
+    });
+
+    if (authToken) {
+      tryLogin(authToken);
+    }
+  </script>
+</body>
+</html>

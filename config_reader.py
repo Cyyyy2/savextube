@@ -12,15 +12,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def load_toml_config(config_path: str = "/app/config/savextube.toml") -> Dict[str, Any]:
+def load_toml_config(config_path: str = None) -> Dict[str, Any]:
     """
-    从 TOML 配置文件中加载配置
-    
-    Args:
-        config_path: 配置文件路径，默认为 /app/config/savextube.toml
-        
-    Returns:
-        配置字典
+    从 TOML 配置文件中加载配置。
+
+    查找顺序：
+    1. 显式传入的 config_path
+    2. 环境变量 SAVEXTUBE_CONFIG
+    3. /app/config/savextube.toml（Docker）
+    4. 当前工作目录 / 项目根目录的 savextube.toml（本地开发）
     """
     try:
         # 尝试导入 TOML 解析库，优先级：tomllib > tomli > toml
@@ -42,27 +42,53 @@ def load_toml_config(config_path: str = "/app/config/savextube.toml") -> Dict[st
                     logger.error("❌ 无法导入 TOML 解析库，请安装 tomli 或 toml")
                     return {}
 
-        config_file = Path(config_path)
-        
-        # 检查配置文件是否存在
-        if not config_file.exists():
-            logger.warning(f"⚠️ 配置文件不存在: {config_path}")
+        project_root = Path(__file__).resolve().parent
+        candidates = []
+        if config_path:
+            candidates.append(Path(config_path))
+        env_path = os.getenv("SAVEXTUBE_CONFIG", "").strip()
+        if env_path:
+            candidates.append(Path(env_path))
+        candidates.extend([
+            Path("/app/config/savextube.toml"),
+            Path.cwd() / "savextube.toml",
+            project_root / "savextube.toml",
+            project_root / "config" / "savextube.toml",
+        ])
+
+        config_file = None
+        seen = set()
+        for path in candidates:
+            try:
+                resolved = str(path.resolve()) if path.exists() else str(path)
+            except OSError:
+                resolved = str(path)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if path.exists() and path.is_file():
+                config_file = path
+                break
+
+        if not config_file:
+            logger.warning(
+                "⚠️ 配置文件不存在，已尝试: "
+                + ", ".join(str(p) for p in candidates[:6])
+            )
             return {}
-            
-        # 读取并解析 TOML 配置文件
-        logger.info(f"📖 正在读取配置文件: {config_path}")
-        
+
+        logger.info(f"📖 正在读取配置文件: {config_file}")
+
         with open(config_file, 'rb') as f:
             config = load_toml(f)
-            
+
         logger.info(f"✅ 成功读取配置文件，包含 {len(config)} 个配置段")
-        
-        # 打印读取到的配置段名称（用于调试）
+
         for section_name in config.keys():
             logger.info(f"   📁 配置段: {section_name}")
-            
+
         return config
-        
+
     except Exception as e:
         logger.error(f"❌ 读取配置文件失败: {e}")
         return {}
@@ -80,6 +106,10 @@ def get_telegram_config(config: Dict[str, Any]) -> Dict[str, Any]:
     telegram_config = config.get('telegram', {})
     
     # 提取所有 Telegram 相关配置
+    enable_bot = telegram_config.get('enable_bot', False)
+    if isinstance(enable_bot, str):
+        enable_bot = enable_bot.strip().lower() in ('1', 'true', 'yes', 'on')
+
     telegram_settings = {
         'bot_token': telegram_config.get('telegram_bot_token', ''),
         'api_id': telegram_config.get('telegram_bot_api_id', ''),
@@ -87,6 +117,7 @@ def get_telegram_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'allowed_user_ids': telegram_config.get('telegram_bot_allowed_user_ids', ''),
         'config_path': telegram_config.get('telegram_bot_config_path', '/config/settings.json'),
         'session_file': telegram_config.get('telegram_session_file', '/app/cookies/'),
+        'enable_bot': bool(enable_bot),
     }
     
     # 处理 bot_token 的特殊格式（移除可能的等号）
@@ -241,6 +272,31 @@ def get_youtube_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'convert_to_mp4': youtube_config.get('youtube_convert_to_mp4', True),
     }
 
+def get_web_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从配置中提取网页下载入口相关配置
+    """
+    web_config = config.get('web', {})
+    telegram_config = config.get('telegram', {})
+
+    auth_token = (
+        web_config.get('web_auth_token')
+        or web_config.get('auth_token')
+        or web_config.get('web_password')
+        or web_config.get('password')
+        or ''
+    )
+
+    enable_bot = telegram_config.get('enable_bot', False)
+    if isinstance(enable_bot, str):
+        enable_bot = enable_bot.strip().lower() in ('1', 'true', 'yes', 'on')
+
+    return {
+        'auth_token': str(auth_token).strip() if auth_token else '',
+        'port': int(web_config.get('web_port', web_config.get('port', 8530)) or 8530),
+        'enable_telegram_bot': bool(enable_bot),
+    }
+
 def get_config_with_fallback(toml_config: Dict[str, Any], env_var: str, toml_key: str, default: str = "") -> str:
     """
     获取配置值，支持 TOML 配置和环境变量回退
@@ -360,6 +416,12 @@ def print_config_summary(config: Dict[str, Any]):
     # YouTube 配置
     youtube_config = get_youtube_config(config)
     logger.info(f"   ▶️ YouTube 转换为 MP4: {youtube_config['convert_to_mp4']}")
+
+    # Web 配置
+    web_config = get_web_config(config)
+    logger.info(f"   🌐 Web 端口: {web_config['port']}")
+    logger.info(f"   🔐 Web Token 已配置: {'是' if web_config['auth_token'] else '否'}")
+    logger.info(f"   🤖 启用 Telegram Bot: {web_config['enable_telegram_bot']}")
     
     logger.info("📊 配置摘要完成")
 

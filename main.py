@@ -146,14 +146,16 @@ try:
         load_toml_config,
         get_telegram_config,
         get_proxy_config,
+        get_web_config,
         print_config_summary
     )
     CONFIG_READER_AVAILABLE = True
 except ImportError:
-    logger.warning("⚠️ 无法导入配置读取器，将禁用 TOML 配置文件支持")
+    logging.getLogger(__name__).warning("⚠️ 无法导入配置读取器，将禁用 TOML 配置文件支持")
     load_toml_config = None
     get_telegram_config = None
     get_proxy_config = None
+    get_web_config = None
     print_config_summary = None
     CONFIG_READER_AVAILABLE = False
 
@@ -369,6 +371,51 @@ def extract_xiaohongshu_url(text):
 
     return None
 # 抖音和小红书下载相关导入
+def _sanitize_playwright_browsers_path() -> None:
+    """Cursor 等沙箱可能注入残缺的 PLAYWRIGHT_BROWSERS_PATH，导致 chromium 找不到。"""
+    import os
+    from pathlib import Path
+
+    browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not browsers_path:
+        return
+    normalized = browsers_path.replace("\\", "/").lower()
+    # Cursor 沙箱缓存经常只有空目录，一律回退到默认 ms-playwright
+    if "cursor-sandbox-cache" in normalized:
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+        return
+    root = Path(browsers_path)
+    has_executable = root.is_dir() and (
+        any(root.rglob("chrome-headless-shell.exe"))
+        or any(root.rglob("chrome.exe"))
+        or any(root.rglob("headless_shell"))
+        or any(root.rglob("chromium"))
+    )
+    # Linux/mac 可执行文件无扩展名，再检查常见目录是否非空
+    if not has_executable and root.is_dir():
+        for pattern in ("chromium_headless_shell-*", "chromium-*"):
+            for d in root.glob(pattern):
+                if d.is_dir() and any(d.rglob("*")):
+                    # 目录存在但无 chrome 可执行文件仍视为无效
+                    exes = list(d.rglob("chrome*")) + list(d.rglob("*headless*"))
+                    if exes:
+                        has_executable = True
+                        break
+            if has_executable:
+                break
+    if not has_executable:
+        os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+
+
+def _launch_playwright_chromium(playwright_instance, **launch_kwargs):
+    """启动 Chromium 前再次清理无效浏览器路径。"""
+    _sanitize_playwright_browsers_path()
+    kwargs = {"headless": True}
+    kwargs.update(launch_kwargs)
+    return playwright_instance.chromium.launch(**kwargs)
+
+_sanitize_playwright_browsers_path()
+
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
@@ -4423,6 +4470,72 @@ class VideoDownloader:
             logger.warning(f"⚠️ curl 检测失败: {e}")
             return None
 
+    async def parse_media(self, url: str) -> Dict[str, Any]:
+        """仅解析媒体信息（标题/作者/直链），不下载落盘。供网页「开始解析」预览使用。"""
+        original = (url or "").strip()
+        if not original:
+            return {"success": False, "error": "缺少 url"}
+
+        # 复用下载入口的基础清理逻辑（短文本分享口令等）
+        text = original
+        if text.startswith("tp://"):
+            text = "http://" + text[5:]
+        elif text.startswith("tps://"):
+            text = "https://" + text[6:]
+
+        needs_cleanup = (
+            " " in text
+            or "（" in text
+            or "）" in text
+            or "《" in text
+            or "》" in text
+            or "@" in text
+            or not text.startswith(("http://", "https://"))
+        )
+        if needs_cleanup:
+            clean = self._extract_clean_url_from_text(text)
+            if clean:
+                text = clean
+            elif not text.startswith(("http://", "https://")):
+                text = "https://" + text
+
+        platform = self.get_platform_name(text)
+        logger.info(f"🔍 [PARSE_MEDIA] url={text} platform={platform}")
+
+        if platform == "douyin":
+            class MockMessage:
+                chat_id = 0
+                message_id = 0
+
+            return await self._download_douyin_with_playwright(
+                text, MockMessage(), message_updater=None, parse_only=True
+            )
+
+        # 其他平台：先识别，提示直接下载（后续可继续扩展预览）
+        name_map = {
+            "xiaohongshu": "Xiaohongshu",
+            "kuaishou": "Kuaishou",
+            "youtube": "YouTube",
+            "bilibili": "Bilibili",
+            "x": "X",
+            "instagram": "Instagram",
+            "facebook": "Facebook",
+            "tiktok": "TikTok",
+            "weibo": "Weibo",
+            "other": "Unknown",
+        }
+        display = name_map.get(str(platform).lower(), str(platform))
+        return {
+            "success": True,
+            "platform": display,
+            "content_type": "unknown",
+            "title": "",
+            "author": "",
+            "share_url": text,
+            "media": [],
+            "message": f"已识别为 {display}，预览暂仅支持抖音；可直接点「一键下载」保存到服务器。",
+        }
+
     async def download_video(
         self, url: str, message_updater=None, auto_playlist=False, status_message=None, loop=None, context=None
     ) -> Dict[str, Any]:
@@ -4602,7 +4715,7 @@ class VideoDownloader:
 
         # 处理抖音链接 - 使用Playwright方法
         if is_douyin:
-            logger.info("🎬 检测到抖音链接，使用Playwright方法下载")
+            logger.info("🎬 检测到抖音链接，使用Playwright下载（视频/图集）")
             # 创建一个模拟的message对象用于Playwright方法
             class MockMessage:
                 def __init__(self, chat_id=0):
@@ -10861,7 +10974,7 @@ class VideoDownloader:
                 # 小红书不需要 cookies
 
                 # 小红书浏览器配置 - 参考douyin.py
-                browser = await p.chromium.launch(headless=True)
+                browser = await _launch_playwright_chromium(p)
                 context = await browser.new_context(
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
                     viewport={'width': 1920, 'height': 1080},
@@ -11142,6 +11255,421 @@ class VideoDownloader:
         except Exception as e:
             logger.warning(f"抖音HTML正则提取失败: {str(e)}")
         return None
+
+    async def _extract_douyin_images_from_html(self, html: str) -> list:
+        """从抖音HTML提取图集图片直链（优先 url_list 最后一项，通常为无水印原图）"""
+        try:
+            logger.info(f"[extract_images] HTML长度: {len(html)} 字符")
+            collected: list = []
+
+            def pick_best_url(url_list) -> Optional[str]:
+                if not isinstance(url_list, list):
+                    return None
+                from html import unescape as _html_unescape
+
+                def _normalize(u: str) -> str:
+                    u = _html_unescape(u)
+                    u = (
+                        u.replace("\\u002F", "/")
+                        .replace("\\u0026", "&")
+                        .replace("\\/", "/")
+                        .replace("&amp;", "&")
+                    )
+                    return u.strip()
+
+                def _score(u: str) -> int:
+                    low = u.lower()
+                    score = 0
+                    if "x-signature" in low or "x-expires" in low:
+                        score += 20
+                    if "?" in u:
+                        score += 8
+                    if "aweme-images" in low or "origin" in low or "obj/" in low:
+                        score += 10
+                    if "water-v2" in low or "lqen" in low:
+                        score -= 8
+                    if "shrink" in low or "thumb" in low or "resize" in low or "100x100" in low:
+                        score -= 6
+                    # 更长的签名 URL 通常更完整
+                    score += min(len(u) // 80, 5)
+                    return score
+
+                candidates = [
+                    _normalize(u)
+                    for u in url_list
+                    if isinstance(u, str) and u.startswith("http")
+                ]
+                candidates = [u for u in candidates if u.startswith("http")]
+                if not candidates:
+                    return None
+                return max(candidates, key=_score)
+
+            def is_noise_url(u: str) -> bool:
+                low = u.lower()
+                return any(x in low for x in (
+                    "avatar", "emoji", "icon", "logo", "static", "client_version",
+                    "douyin_pc_client", "favicon"
+                ))
+
+            def collect_from_images(images) -> list:
+                urls = []
+                if not isinstance(images, list):
+                    return urls
+                for image in images:
+                    if not isinstance(image, dict):
+                        continue
+                    best = None
+                    for key in ("download_url_list", "url_list"):
+                        best = pick_best_url(image.get(key))
+                        if best:
+                            break
+                    if not best:
+                        for nested_key in ("origin_url", "display_image", "largest", "thumb"):
+                            nested = image.get(nested_key)
+                            if isinstance(nested, dict):
+                                best = pick_best_url(nested.get("url_list"))
+                                if best:
+                                    break
+                    if best and not is_noise_url(best):
+                        urls.append(best)
+                return urls
+
+            def walk(obj) -> list:
+                found = []
+                if isinstance(obj, dict):
+                    image_post = obj.get("image_post_info")
+                    if isinstance(image_post, dict):
+                        found.extend(collect_from_images(image_post.get("images")))
+                    images = obj.get("images")
+                    if isinstance(images, list) and images and isinstance(images[0], dict):
+                        if any(k in images[0] for k in ("url_list", "download_url_list", "origin_url")):
+                            found.extend(collect_from_images(images))
+                    for value in obj.values():
+                        if isinstance(value, (dict, list)):
+                            found.extend(walk(value))
+                elif isinstance(obj, list):
+                    for item in obj:
+                        if isinstance(item, (dict, list)):
+                            found.extend(walk(item))
+                return found
+
+            # 1) RENDER_DATA（PC 页常见）
+            render_match = re.search(
+                r'<script[^>]*id=["\']RENDER_DATA["\'][^>]*>(.*?)</script>',
+                html,
+                re.DOTALL | re.IGNORECASE,
+            )
+            if render_match:
+                try:
+                    from urllib.parse import unquote
+                    render_data = json.loads(unquote(render_match.group(1)))
+                    collected.extend(walk(render_data))
+                except Exception as e:
+                    logger.warning(f"[extract_images] RENDER_DATA 解析失败: {e}")
+
+            # 1.5) 直接 raw_decode 所有 "images":[ ... ] 数组（比整页 walk 更稳）
+            if not collected or len(collected) < 2:
+                decoder = json.JSONDecoder()
+                for m in re.finditer(r'"images"\s*:\s*\[', html):
+                    start = m.end() - 1
+                    try:
+                        arr, _ = decoder.raw_decode(html[start:])
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(arr, list)
+                        and arr
+                        and isinstance(arr[0], dict)
+                        and any(k in arr[0] for k in ("url_list", "download_url_list"))
+                    ):
+                        collected.extend(collect_from_images(arr))
+
+            # 2) 含 aweme 数据的 script JSON（移动页常见，复用视频提取的清理思路）
+            if not collected:
+                script_matches = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+                for script_content in script_matches:
+                    if not any(k in script_content for k in ("aweme_id", "image_post_info", '"images"')):
+                        continue
+                    json_matches = re.findall(r'({.*?"(?:aweme_id|image_post_info|images)".*?})', script_content, re.DOTALL)
+                    for json_str in json_matches:
+                        try:
+                            brace_count = 0
+                            json_end = -1
+                            for i, char in enumerate(json_str):
+                                if char == "{":
+                                    brace_count += 1
+                                elif char == "}":
+                                    brace_count -= 1
+                                    if brace_count == 0:
+                                        json_end = i + 1
+                                        break
+                            if json_end <= 0:
+                                continue
+                            data = json.loads(json_str[:json_end])
+                            collected.extend(walk(data))
+                            if collected:
+                                break
+                        except json.JSONDecodeError:
+                            continue
+                    if collected:
+                        break
+
+            # 3) 正则兜底：抖音 CDN 大图
+            if not collected:
+                patterns = [
+                    r'https://[^"\\\s]+\.douyinpic\.com/[^"\\\s]+\.(?:jpeg|jpg|png|webp)',
+                    r'https://[^"\\\s]+\.douyincdn\.com/[^"\\\s]+\.(?:jpeg|jpg|png|webp)',
+                    r'https://[^"\\\s]+tos[^"\\\s]+\.(?:jpeg|jpg|png|webp)\?[^"\\\s]*',
+                ]
+                for pattern in patterns:
+                    for m in re.findall(pattern, html, re.IGNORECASE):
+                        u = m.replace("\\u002F", "/").replace("\\u0026", "&")
+                        if not is_noise_url(u):
+                            collected.append(u)
+
+            # 去重保序，并规范化 HTML 转义
+            from html import unescape as _html_unescape
+            from urllib.parse import urlparse as _urlparse
+
+            seen = set()
+            unique = []
+            for u in collected:
+                u = _html_unescape(u).replace("&amp;", "&").replace("\\u0026", "&").replace("\\/", "/")
+                if u not in seen:
+                    seen.add(u)
+                    unique.append(u)
+
+            # 同一 path 若有带签名版本，丢掉无签名版本
+            signed_paths = {
+                _urlparse(u).path
+                for u in unique
+                if "x-signature" in u.lower() or "x-expires" in u.lower()
+            }
+            if signed_paths:
+                filtered = []
+                for u in unique:
+                    path = _urlparse(u).path
+                    has_sign = "x-signature" in u.lower() or "x-expires" in u.lower()
+                    if path in signed_paths and not has_sign:
+                        continue
+                    filtered.append(u)
+                unique = filtered
+
+            logger.info(f"[extract_images] 提取到 {len(unique)} 张图片")
+            return unique
+        except Exception as e:
+            logger.warning(f"抖音图集提取失败: {e}")
+            return []
+
+    def _collect_douyin_image_urls(self, images: list) -> list:
+        """从 images 数组挑选每张图的最佳直链。"""
+        from html import unescape as _html_unescape
+
+        def _normalize(u: str) -> str:
+            return (
+                _html_unescape(u)
+                .replace("\\u002F", "/")
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
+                .replace("&amp;", "&")
+                .strip()
+            )
+
+        def _score(u: str) -> int:
+            low = u.lower()
+            score = 0
+            if "x-signature" in low or "x-expires" in low:
+                score += 20
+            if "?" in u:
+                score += 8
+            if "aweme-images" in low or "origin" in low:
+                score += 10
+            if "water-v2" in low or "lqen" in low:
+                score -= 8
+            if "shrink" in low or "thumb" in low or "100x100" in low or "avatar" in low:
+                score -= 10
+            score += min(len(u) // 80, 5)
+            return score
+
+        urls = []
+        if not isinstance(images, list):
+            return urls
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            candidates = []
+            for key in ("url_list", "download_url_list"):
+                raw = image.get(key)
+                if isinstance(raw, list):
+                    candidates.extend(
+                        [_normalize(u) for u in raw if isinstance(u, str) and u.startswith("http")]
+                    )
+            if not candidates:
+                continue
+            best = max(candidates, key=_score)
+            if any(x in best.lower() for x in ("avatar", "emoji", "favicon", "100x100")):
+                continue
+            urls.append(best)
+        return urls
+
+    def _extract_douyin_images_from_obj(self, data) -> list:
+        """从 slidesinfo / aweme JSON 对象中提取图集直链。"""
+        found_arrays = []
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                images = obj.get("images")
+                if (
+                    isinstance(images, list)
+                    and images
+                    and isinstance(images[0], dict)
+                    and any(k in images[0] for k in ("url_list", "download_url_list"))
+                ):
+                    found_arrays.append(images)
+                for value in obj.values():
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, (dict, list)):
+                        walk(item)
+
+        walk(data)
+        if not found_arrays:
+            return []
+        best = max(found_arrays, key=len)
+        return self._collect_douyin_image_urls(best)
+
+    async def _download_douyin_image_files(
+        self,
+        image_urls: list,
+        title: Optional[str],
+        author: Optional[str],
+        download_dir: str,
+        message_updater=None,
+    ) -> dict:
+        """下载抖音图集到本地目录"""
+        try:
+            import httpx
+
+            os.makedirs(download_dir, exist_ok=True)
+            if title:
+                clean_title = self._sanitize_filename(title)
+                clean_title = clean_title.lstrip("#").strip().split("#")[0].strip()
+                clean_title = re.sub(
+                    r"[-_ ]*(抖音|快手|小红书|YouTube|youtube)$",
+                    "",
+                    clean_title,
+                    flags=re.IGNORECASE,
+                ).strip()
+            else:
+                clean_title = ""
+            if not clean_title:
+                clean_title = f"douyin_{int(time.time())}"
+
+            album_dir = os.path.join(download_dir, clean_title)
+            os.makedirs(album_dir, exist_ok=True)
+
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+                "Referer": "https://www.douyin.com/",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            }
+
+            files = []
+            total_size = 0
+            total = len(image_urls)
+
+            if message_updater:
+                try:
+                    tip = f"🖼️ 开始下载抖音图集（共 {total} 张）: {clean_title}"
+                    if asyncio.iscoroutinefunction(message_updater):
+                        await message_updater(tip)
+                    else:
+                        message_updater(tip)
+                except Exception:
+                    pass
+
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+                for idx, img_url in enumerate(image_urls, 1):
+                    low = img_url.lower().split("?")[0]
+                    ext = ".jpg"
+                    for candidate in (".jpeg", ".jpg", ".png", ".webp", ".heic"):
+                        if low.endswith(candidate):
+                            ext = candidate
+                            break
+                    filename = f"{idx:02d}{ext}"
+                    file_path = os.path.join(album_dir, filename)
+
+                    logger.info(f"🖼️ 下载抖音图片 {idx}/{total}: {img_url[:120]}...")
+                    resp = await client.get(img_url, headers=headers)
+                    if resp.status_code != 200 or not resp.content:
+                        logger.warning(f"⚠️ 图片下载失败 HTTP {resp.status_code}: {img_url[:120]}")
+                        continue
+
+                    with open(file_path, "wb") as f:
+                        f.write(resp.content)
+
+                    size = len(resp.content)
+                    total_size += size
+                    files.append({"path": file_path, "size": size, "url": img_url})
+
+                    if message_updater:
+                        try:
+                            progress = {
+                                "status": "downloading",
+                                "downloaded_bytes": total_size,
+                                "total_bytes": 0,
+                                "speed": 0,
+                                "eta": 0,
+                                "filename": f"{clean_title}/{filename} ({idx}/{total})",
+                            }
+                            if asyncio.iscoroutinefunction(message_updater):
+                                await message_updater(progress)
+                            else:
+                                message_updater(progress)
+                        except Exception:
+                            pass
+
+            if not files:
+                return {
+                    "success": False,
+                    "error": "图集图片全部下载失败",
+                    "platform": "Douyin",
+                    "content_type": "image",
+                }
+
+            file_formats = sorted({
+                os.path.splitext(f["path"])[1].lower().lstrip(".").upper()
+                for f in files
+                if os.path.splitext(f["path"])[1]
+            })
+
+            logger.info(f"✅ 抖音图集下载完成: {len(files)} 张 -> {album_dir}")
+            return {
+                "success": True,
+                "title": clean_title,
+                "author": author or "未知作者",
+                "files_count": len(files),
+                "total_size_mb": total_size / (1024 * 1024),
+                "download_path": album_dir,
+                "files": files,
+                "file_formats": file_formats,
+                "platform": "Douyin",
+                "content_type": "image",
+            }
+        except Exception as e:
+            logger.error(f"❌ 抖音图集下载异常: {e}")
+            return {
+                "success": False,
+                "error": f"图集下载失败: {str(e)}",
+                "platform": "Douyin",
+                "content_type": "image",
+            }
 
     async def _get_douyin_no_watermark_url(self, video_id: str) -> str:
         """通过抖音官方接口获取无水印视频直链"""
@@ -11454,8 +11982,8 @@ class VideoDownloader:
             await page.set_extra_http_headers(headers[platform])
             logger.info(f"🎬 已设置 {platform.value} 平台请求头")
 
-    async def _download_douyin_with_playwright(self, url: str, message: types.Message, message_updater=None) -> dict:
-        """使用Playwright下载抖音视频 - 完全复制douyin.py的extract逻辑"""
+    async def _download_douyin_with_playwright(self, url: str, message: types.Message, message_updater=None, parse_only: bool = False) -> dict:
+        """使用Playwright下载/解析抖音视频或图集。parse_only=True 时只返回媒体地址，不落盘。"""
         if not PLAYWRIGHT_AVAILABLE:
             return {
                 "success": False,
@@ -11489,16 +12017,16 @@ class VideoDownloader:
                 XIAOHONGSHU = "xiaohongshu"
                 UNKNOWN = "unknown"
 
-            logger.info(f"🎬 开始下载抖音视频: {url}")
+            logger.info(f"{'🔍 开始解析' if parse_only else '🎬 开始下载'}抖音内容: {url}")
 
             total_start = time.time()
             platform = Platform.DOUYIN
 
             async with async_playwright() as p:
                 # 按照douyin.py启动浏览器（无特殊参数）
-                browser = await p.chromium.launch(headless=True)
+                browser = await _launch_playwright_chromium(p)
 
-                # 按照douyin.py的context配置（抖音用手机版）
+                # 抖音 context：不要设置全局 Accept，否则会破坏 slidesinfo 等 XHR
                 context = await browser.new_context(
                     user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
                     viewport={'width': 375, 'height': 667},
@@ -11508,12 +12036,6 @@ class VideoDownloader:
                     is_mobile=True,
                     has_touch=True,
                     color_scheme='light',
-                    extra_http_headers={
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,video/mp4,*/*;q=0.8',
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                        'Connection': 'keep-alive',
-                        'Upgrade-Insecure-Requests': '1',
-                    }
                 )
 
                 page = await context.new_page()
@@ -11535,10 +12057,10 @@ class VideoDownloader:
                     except Exception as e:
                         logger.warning(f"[extract] cookies加载失败: {e}")
 
-                # 准备video_id监听
+                # 准备video_id监听 + 图集 slidesinfo API 监听
                 video_id_holder = {'id': None}
+                slides_holder = {'data': None, 'url': None}
 
-                # 备用：监听网络请求中的video_id
                 def handle_video_id(request):
                     request_url = request.url
                     if 'video_id=' in request_url:
@@ -11548,6 +12070,17 @@ class VideoDownloader:
                             logger.info(f"[extract] 网络请求中捕获到 video_id: {m.group(1)}")
                 page.on("request", handle_video_id)
 
+                async def handle_slidesinfo(response):
+                    try:
+                        if "slidesinfo" in response.url and response.status == 200:
+                            # 必须立刻读 body，否则响应体会被丢弃
+                            slides_holder["url"] = response.url
+                            slides_holder["data"] = await response.json()
+                            logger.info("[extract] 即时捕获 slidesinfo JSON 成功")
+                    except Exception as e:
+                        logger.warning(f"[extract] slidesinfo 即时读取失败: {e}")
+                page.on("response", handle_slidesinfo)
+
                 try:
                     # 按照douyin.py设置headers
                     await self._set_platform_headers(page, platform)
@@ -11555,49 +12088,132 @@ class VideoDownloader:
                     # 处理短链接重定向（关键修复）
                     if 'v.douyin.com' in url:
                         logger.info(f"[extract] 检测到短链接，先获取重定向: {url}")
-                        response = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        await page.goto(url, wait_until="networkidle", timeout=45000)
+                        # create_task 读 JSON 需要一点时间
+                        for _ in range(10):
+                            if slides_holder.get("data"):
+                                break
+                            await asyncio.sleep(0.2)
+
                         real_url = page.url
                         logger.info(f"[extract] 短链接重定向到: {real_url}")
 
-                        # 提取video_id并构造标准douyin.com链接
+                        # 提取 video/note/slides id
                         import re
                         video_id_match = re.search(r'/video/(\d+)', real_url)
-                        if video_id_match:
+                        note_id_match = re.search(r'/note/(\d+)', real_url)
+                        slides_id_match = re.search(r'/share/slides/(\d+)', real_url)
+                        is_slides = bool(slides_id_match) or 'is_slides=1' in real_url
+                        if video_id_match and not is_slides:
                             video_id = video_id_match.group(1)
                             standard_url = f"https://www.douyin.com/video/{video_id}"
-                            logger.info(f"[extract] 转换为标准链接: {standard_url}")
+                            logger.info(f"[extract] 转换为标准视频链接: {standard_url}")
                             await page.goto(standard_url, wait_until="domcontentloaded", timeout=30000)
                             logger.info(f"[extract] 访问标准链接完成")
+                        elif is_slides:
+                            if slides_holder.get("data"):
+                                logger.info("[extract] 短链页已拿到 slidesinfo")
+                            else:
+                                slides_id = slides_id_match.group(1) if slides_id_match else (
+                                    note_id_match.group(1) if note_id_match else None
+                                )
+                                logger.info("[extract] 短链页未捕获 slidesinfo，尝试 reload")
+                                try:
+                                    async with page.expect_response(
+                                        lambda r: "slidesinfo" in r.url and r.status == 200,
+                                        timeout=25000,
+                                    ) as slides_wait:
+                                        await page.reload(wait_until="networkidle", timeout=45000)
+                                    slides_resp = await slides_wait.value
+                                    if slides_holder.get("data") is None:
+                                        slides_holder["url"] = slides_resp.url
+                                        slides_holder["data"] = await slides_resp.json()
+                                    logger.info("[extract] reload 获取 slidesinfo 成功")
+                                except Exception as e:
+                                    logger.warning(f"[extract] reload slidesinfo 失败: {e}")
+                                    if slides_id:
+                                        standard_url = f"https://www.iesdouyin.com/share/slides/{slides_id}/"
+                                        await page.goto(standard_url, wait_until="networkidle", timeout=45000)
+                                        for _ in range(20):
+                                            if slides_holder.get("data"):
+                                                break
+                                            await asyncio.sleep(0.25)
+                            logger.info("[extract] 访问 slides 页完成")
+                        elif note_id_match:
+                            note_id = note_id_match.group(1)
+                            standard_url = f"https://www.douyin.com/note/{note_id}"
+                            logger.info(f"[extract] 转换为标准图集链接: {standard_url}")
+                            await page.goto(standard_url, wait_until="domcontentloaded", timeout=30000)
+                            logger.info(f"[extract] 访问标准图集链接完成")
                         else:
-                            # 如果提取不到video_id，直接用重定向的URL
+                            # 如果提取不到id，直接用重定向的URL
                             if real_url != url:
                                 await page.goto(real_url, wait_until="domcontentloaded", timeout=30000)
                                 logger.info(f"[extract] 重新访问真实URL完成")
                     else:
                         logger.info("[extract] goto 前")
-                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        logger.info("[extract] goto 后，等待 video_id")
+                        # 非短链也兼容 note / slides
+                        note_id_match = re.search(r'/note/(\d+)', url)
+                        slides_id_match = re.search(r'/share/slides/(\d+)', url)
+                        if slides_id_match:
+                            url = f"https://www.iesdouyin.com/share/slides/{slides_id_match.group(1)}/"
+                            try:
+                                async with page.expect_response(
+                                    lambda r: "slidesinfo" in r.url and r.status == 200,
+                                    timeout=30000,
+                                ) as slides_wait:
+                                    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                                slides_resp = await slides_wait.value
+                                slides_holder["url"] = slides_resp.url
+                                slides_holder["response"] = slides_resp
+                                slides_holder["data"] = await slides_resp.json()
+                                logger.info("[extract] expect_response 获取 slidesinfo 成功")
+                            except Exception as e:
+                                logger.warning(f"[extract] expect_response slidesinfo 失败，回退: {e}")
+                                await page.goto(url, wait_until="networkidle", timeout=45000)
+                        elif note_id_match:
+                            url = f"https://www.douyin.com/note/{note_id_match.group(1)}"
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        else:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        logger.info("[extract] goto 后，等待内容数据")
 
                     # 调试：检查页面是否正确加载
                     page_title = await page.title()
                     current_url = page.url
                     logger.info(f"[debug] 页面标题: {repr(page_title)}")
                     logger.info(f"[debug] 当前URL: {current_url}")
+                    is_note_page = bool(re.search(r'/note/|/share/slides/', current_url)) or bool(
+                        slides_holder.get("data")
+                    )
 
-                    # 直接从URL提取video_id（最关键的修复）
+                    # 直接从URL提取video_id / note_id
                     video_id_match = re.search(r'/video/(\d+)', current_url)
+                    note_id_match = re.search(r'/note/(\d+)|/share/slides/(\d+)', current_url)
                     if video_id_match:
                         video_id_holder['id'] = video_id_match.group(1)
                         logger.info(f"[extract] 从当前URL直接提取到 video_id: {video_id_holder['id']}")
+                    elif note_id_match:
+                        video_id_holder['id'] = note_id_match.group(1) or note_id_match.group(2)
+                        logger.info(f"[extract] 从当前URL提取到 note_id: {video_id_holder['id']}")
                     else:
                         # 如果当前URL提取失败，从原始URL提取
                         video_id_match = re.search(r'/video/(\d+)', url)
+                        note_id_match = re.search(r'/note/(\d+)|/share/slides/(\d+)', url)
                         if video_id_match:
                             video_id_holder['id'] = video_id_match.group(1)
                             logger.info(f"[extract] 从原始URL提取到 video_id: {video_id_holder['id']}")
+                        elif note_id_match:
+                            video_id_holder['id'] = note_id_match.group(1) or note_id_match.group(2)
+                            logger.info(f"[extract] 从原始URL提取到 note_id: {video_id_holder['id']}")
 
                     # 按照douyin.py：抖音先等2秒
                     await asyncio.sleep(2)
+                    if is_note_page and not slides_holder.get('data'):
+                        for _ in range(12):
+                            if slides_holder.get('data'):
+                                break
+                            await asyncio.sleep(0.25)
 
                     # 按照douyin.py：等待video_id出现，最多等3秒
                     wait_start = time.time()
@@ -11624,14 +12240,53 @@ class VideoDownloader:
                     logger.info("[extract] 进入HTML提取流程")
                     html = await page.content()
 
-                    # 根据平台选择不同的提取方法
-                    if platform == Platform.DOUYIN:
-                        video_url = await self._extract_douyin_url_from_html(html)
-                    else:
-                        # 通用提取方法
-                        video_url = await self._extract_douyin_url_from_html(html)
+                    # 优先尝试图集（slidesinfo API > HTML；note/slides 页）
+                    image_urls = []
+                    if slides_holder.get("data"):
+                        image_urls = self._extract_douyin_images_from_obj(slides_holder["data"])
+                        logger.info(f"[extract] slidesinfo 提取到 {len(image_urls)} 张图片")
+                    if not image_urls:
+                        image_urls = await self._extract_douyin_images_from_html(html)
+                    if image_urls and (is_note_page or len(image_urls) >= 1):
+                        # 图集作品：有 images 时优先下图（避免把配乐/封面当成视频）
+                        title = await self._get_video_title(page, platform)
+                        author = await self._get_video_author(page, platform)
+                        # slidesinfo 里可能带 desc
+                        if slides_holder.get("data") and not title:
+                            try:
+                                details = (slides_holder["data"] or {}).get("aweme_details") or []
+                                if details:
+                                    title = details[0].get("desc") or title
+                                    author_info = details[0].get("author") or {}
+                                    author = author_info.get("nickname") or author
+                            except Exception:
+                                pass
+                        logger.info(f"[extract] 识别为抖音图集，共 {len(image_urls)} 张")
+                        if parse_only:
+                            result = {
+                                "success": True,
+                                "title": title or "抖音图集",
+                                "author": author or "未知作者",
+                                "platform": "Douyin",
+                                "content_type": "image",
+                                "share_url": url,
+                                "media": [{"type": "image", "url": u} for u in image_urls],
+                            }
+                        else:
+                            result = await self._download_douyin_image_files(
+                                image_urls,
+                                title,
+                                author,
+                                str(self.douyin_download_path),
+                                message_updater,
+                            )
+                        await page.close()
+                        await context.close()
+                        await browser.close()
+                        return result
 
-                    logger.info(f"[extract] 正则提取结果: {video_url}")
+                    video_url = await self._extract_douyin_url_from_html(html)
+                    logger.info(f"[extract] 视频正则提取结果: {video_url}")
 
                     if video_url:
                         # 如果是带水印的URL，尝试转换为无水印URL
@@ -11665,36 +12320,75 @@ class VideoDownloader:
                             logger.info(f"[extract] 正则流程命中: {video_url}")
                             title = await self._get_video_title(page, platform)
                             author = await self._get_video_author(page, platform)
-                            video_info = VideoInfo(
-                                video_id=str(int(time.time())),
-                                platform=platform,
-                                share_url=url,
-                                download_url=video_url,
-                                title=title,
-                                author=author,
-                                thumbnail_url=None
-                            )
-                            logger.info("[extract] 正则流程完成")
-
-                            # 下载视频
-                            download_result = await self._download_video_file(
-                                video_info,
-                                str(self.douyin_download_path),
-                                message_updater,
-                                None
-                            )
+                            if parse_only:
+                                result = {
+                                    "success": True,
+                                    "title": title or "抖音视频",
+                                    "author": author or "未知作者",
+                                    "platform": "Douyin",
+                                    "content_type": "video",
+                                    "share_url": url,
+                                    "media": [{"type": "video", "url": video_url}],
+                                }
+                            else:
+                                video_info = VideoInfo(
+                                    video_id=str(int(time.time())),
+                                    platform=platform,
+                                    share_url=url,
+                                    download_url=video_url,
+                                    title=title,
+                                    author=author,
+                                    thumbnail_url=None
+                                )
+                                logger.info("[extract] 正则流程完成")
+                                result = await self._download_video_file(
+                                    video_info,
+                                    str(self.douyin_download_path),
+                                    message_updater,
+                                    None
+                                )
 
                             await page.close()
                             await context.close()
                             await browser.close()
-                            return download_result
+                            return result
                         else:
                             logger.warning(f"[extract] 提取的URL无效: {video_url}")
                             video_url = None
 
+                    # 视频失败时再兜底一次图集提取（可能前面正则误判为空）
+                    if not video_url and not image_urls:
+                        image_urls = await self._extract_douyin_images_from_html(html)
+                    if not video_url and image_urls:
+                        title = await self._get_video_title(page, platform)
+                        author = await self._get_video_author(page, platform)
+                        logger.info(f"[extract] 视频未命中，改下图集，共 {len(image_urls)} 张")
+                        if parse_only:
+                            result = {
+                                "success": True,
+                                "title": title or "抖音图集",
+                                "author": author or "未知作者",
+                                "platform": "Douyin",
+                                "content_type": "image",
+                                "share_url": url,
+                                "media": [{"type": "image", "url": u} for u in image_urls],
+                            }
+                        else:
+                            result = await self._download_douyin_image_files(
+                                image_urls,
+                                title,
+                                author,
+                                str(self.douyin_download_path),
+                                message_updater,
+                            )
+                        await page.close()
+                        await context.close()
+                        await browser.close()
+                        return result
+
                     if not video_url:
-                        logger.info("[extract] 所有流程均未捕获到视频数据，抛出 TimeoutError")
-                        raise TimeoutError("未能捕获到视频数据")
+                        logger.info("[extract] 所有流程均未捕获到视频/图集数据，抛出 TimeoutError")
+                        raise TimeoutError("未能捕获到视频或图集数据")
 
                 finally:
                     logger.info("[extract] 关闭 page/context 前")
@@ -11705,10 +12399,10 @@ class VideoDownloader:
                 await browser.close()
 
         except Exception as e:
-            logger.error(f"抖音下载异常: {str(e)}")
+            logger.error(f"抖音{'解析' if parse_only else '下载'}异常: {str(e)}")
             return {
                 "success": False,
-                "error": f"下载失败: {str(e)}",
+                "error": f"{'解析' if parse_only else '下载'}失败: {str(e)}",
                 "platform": "Douyin",
                 "content_type": "video"
             }
@@ -11770,7 +12464,7 @@ class VideoDownloader:
 
             async with async_playwright() as p:
                 # 启动浏览器（参考抖音配置）
-                browser = await p.chromium.launch(headless=True)
+                browser = await _launch_playwright_chromium(p)
 
                 # 快手使用手机版配置
                 context = await browser.new_context(
@@ -20629,188 +21323,186 @@ async def test_network_connectivity():
     return False
 
 async def main():
-    """主函数 (异步)"""
-    # 启动时环境检查
+    """主函数 (异步)：默认启动网页下载入口；可选启用 Telegram Bot。"""
     logger.info("🔍 开始启动前环境检查...")
 
-    # 读取 TOML 配置文件
     toml_config = {}
     if load_toml_config:
         toml_config = load_toml_config()
         if toml_config:
             logger.info("✅ 成功读取 TOML 配置文件")
-            print_config_summary(toml_config)
+            if print_config_summary:
+                print_config_summary(toml_config)
         else:
             logger.warning("⚠️ TOML 配置文件不存在或读取失败，将使用环境变量")
     else:
         logger.warning("⚠️ 配置读取器不可用，将使用环境变量")
 
-    # 获取 Telegram 配置
-    if toml_config and load_toml_config:
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    enable_telegram_bot = os.getenv("ENABLE_TELEGRAM_BOT", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+    web_auth_token = os.getenv("WEB_AUTH_TOKEN", "").strip()
+    web_port = 8530
+
+    if toml_config and get_telegram_config and get_proxy_config:
         telegram_config = get_telegram_config(toml_config)
         proxy_config = get_proxy_config(toml_config)
-        
-        # 从 TOML 配置获取 Telegram 参数
-        bot_token = telegram_config.get('bot_token', '') or os.getenv("TELEGRAM_BOT_TOKEN", "")
-        allowed_user_ids = telegram_config.get('allowed_user_ids', '') or os.getenv("TELEGRAM_BOT_ALLOWED_USER_IDS", "")
-        api_id = telegram_config.get('api_id', '') or os.getenv("TELEGRAM_BOT_API_ID", "")
-        api_hash = telegram_config.get('api_hash', '') or os.getenv("TELEGRAM_BOT_API_HASH", "")
-        proxy_host = proxy_config.get('proxy_host', '') or os.getenv("PROXY_HOST", "")
-        
-        # 设置为环境变量以保持其他代码的兼容性
+        web_config = get_web_config(toml_config) if get_web_config else {}
+
+        bot_token = telegram_config.get("bot_token", "") or bot_token
+        allowed_user_ids = telegram_config.get("allowed_user_ids", "") or os.getenv(
+            "TELEGRAM_BOT_ALLOWED_USER_IDS", ""
+        )
+        api_id = telegram_config.get("api_id", "") or os.getenv("TELEGRAM_BOT_API_ID", "")
+        api_hash = telegram_config.get("api_hash", "") or os.getenv("TELEGRAM_BOT_API_HASH", "")
+        proxy_host = proxy_config.get("proxy_host", "") or os.getenv("PROXY_HOST", "")
+
+        if web_config:
+            web_auth_token = (web_config.get("auth_token") or web_auth_token or "").strip()
+            web_port = int(web_config.get("port") or web_port)
+            if telegram_config.get("enable_bot") or web_config.get("enable_telegram_bot"):
+                enable_telegram_bot = True
+
         if proxy_host:
-            os.environ['PROXY_HOST'] = proxy_host
+            os.environ["PROXY_HOST"] = proxy_host
             logger.info(f"🌐 从 TOML 配置设置代理: {proxy_host}")
         if api_id:
-            os.environ['TELEGRAM_BOT_API_ID'] = str(api_id)
+            os.environ["TELEGRAM_BOT_API_ID"] = str(api_id)
             logger.info(f"🔑 从 TOML 配置设置 API ID: {api_id}")
         if api_hash:
-            os.environ['TELEGRAM_BOT_API_HASH'] = api_hash
+            os.environ["TELEGRAM_BOT_API_HASH"] = api_hash
             logger.info(f"🔐 从 TOML 配置设置 API Hash: {api_hash[:10]}...")
         if allowed_user_ids:
-            os.environ['TELEGRAM_BOT_ALLOWED_USER_IDS'] = str(allowed_user_ids)
+            os.environ["TELEGRAM_BOT_ALLOWED_USER_IDS"] = str(allowed_user_ids)
             logger.info(f"👥 从 TOML 配置设置允许的用户ID: {allowed_user_ids}")
     else:
-        # 回退到环境变量
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
         logger.info("🔧 使用环境变量配置")
 
-    # 检查关键配置
-    if not bot_token:
-        logger.error("❌ 请在 TOML 配置文件或环境变量中设置 TELEGRAM_BOT_TOKEN")
+    if not web_auth_token:
+        logger.error("❌ 请在 TOML [web] web_auth_token 或环境变量 WEB_AUTH_TOKEN 中设置网页访问 Token")
         sys.exit(1)
 
-    # 网络连接测试和健康检查
+    if enable_telegram_bot and not bot_token:
+        logger.error("❌ 已启用 Telegram Bot，但未配置 telegram_bot_token / TELEGRAM_BOT_TOKEN")
+        sys.exit(1)
+
     logger.info("🔍 开始网络连接测试...")
     if not await test_network_connectivity():
         logger.warning("⚠️ 网络连接测试失败，但将继续尝试启动")
-        # 不要直接退出，继续尝试启动，可能是测试URL的问题
 
-    # 健康检查功能已删除，避免事件循环冲突
-    logger.info("健康检查功能已禁用，避免事件循环冲突")
-    # 硬编码下载路径为 /downloads
-    download_path = "/downloads"
-    
-    # 统一cookies目录配置
-    cookies_base_dir = "/app/cookies"
+    # Docker 默认 /downloads、/app/cookies；本地开发回退到项目目录
+    project_root = Path(__file__).resolve().parent
+
+    def _pick_writable_dir(preferred: str, fallback: Path) -> str:
+        preferred_path = Path(preferred)
+        try:
+            preferred_path.mkdir(parents=True, exist_ok=True)
+            probe = preferred_path / ".writetest"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return str(preferred_path)
+        except Exception:
+            fallback.mkdir(parents=True, exist_ok=True)
+            logger.warning(f"⚠️ 无法使用 {preferred}，回退到本地目录: {fallback}")
+            return str(fallback)
+
+    download_path = os.getenv("DOWNLOAD_PATH") or _pick_writable_dir(
+        "/downloads", project_root / "downloads"
+    )
+    cookies_base_dir = os.getenv("COOKIES_DIR") or _pick_writable_dir(
+        "/app/cookies", project_root / "cookies"
+    )
     x_cookies_path = os.getenv("X_COOKIES") or f"{cookies_base_dir}/x_cookies.txt"
-    b_cookies_path = os.getenv("BILIBILI_COOKIES") or os.getenv("B_COOKIES") or f"{cookies_base_dir}/bilibili_cookies.txt"
+    b_cookies_path = (
+        os.getenv("BILIBILI_COOKIES")
+        or os.getenv("B_COOKIES")
+        or f"{cookies_base_dir}/bilibili_cookies.txt"
+    )
     youtube_cookies_path = os.getenv("YOUTUBE_COOKIES") or f"{cookies_base_dir}/youtube_cookies.txt"
     douyin_cookies_path = os.getenv("DOUYIN_COOKIES") or f"{cookies_base_dir}/douyin_cookies.txt"
     kuaishou_cookies_path = os.getenv("KUAISHOU_COOKIES") or f"{cookies_base_dir}/kuaishou_cookies.txt"
     instagram_cookies_path = os.getenv("INSTAGRAM_COOKIES") or f"{cookies_base_dir}/instagram_cookies.txt"
 
     logger.info(f"📁 下载路径: {download_path}")
-    if x_cookies_path:
-        logger.info(f"X Cookies 路径: {x_cookies_path}")
-    if b_cookies_path:
-        logger.info(f"Bilibili Cookies 路径: {b_cookies_path}")
-    if youtube_cookies_path:
-        logger.info(f"🍪 使用YouTube cookies: {youtube_cookies_path}")
-    if douyin_cookies_path:
-        logger.info(f"🎬 使用抖音 cookies: {douyin_cookies_path}")
-        # 检查文件是否存在
-        if os.path.exists(douyin_cookies_path):
-            file_size = os.path.getsize(douyin_cookies_path)
-            logger.info(f"✅ 抖音 cookies 文件存在，大小: {file_size} 字节")
 
-            # 读取并显示前几行内容
-            try:
-                with open(douyin_cookies_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                    logger.info(f"📄 抖音 cookies 文件包含 {len(lines)} 行")
-                    if lines:
-                        logger.info(f"📝 第一行内容: {lines[0].strip()}")
-                        if len(lines) > 1:
-                            logger.info(f"📝 第二行内容: {lines[1].strip()}")
-            except Exception as e:
-                logger.error(f"❌ 读取抖音 cookies 文件失败: {e}")
-        else:
-            logger.warning(f"⚠️ 抖音 cookies 文件不存在: {douyin_cookies_path}")
-    else:
-        logger.warning("⚠️ 未设置 DOUYIN_COOKIES 环境变量")
-
-    # 检查快手cookies
-    if kuaishou_cookies_path:
-        logger.info(f"⚡ 使用快手 cookies: {kuaishou_cookies_path}")
-        # 检查文件是否存在
-        if os.path.exists(kuaishou_cookies_path):
-            file_size = os.path.getsize(kuaishou_cookies_path)
-            logger.info(f"✅ 快手 cookies 文件存在，大小: {file_size} 字节")
-
-            # 读取并显示前几行内容
-            try:
-                with open(kuaishou_cookies_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                    logger.info(f"📄 快手 cookies 文件包含 {len(lines)} 行")
-                    if lines:
-                        logger.info(f"📝 第一行内容: {lines[0].strip()}")
-                        if len(lines) > 1:
-                            logger.info(f"📝 第二行内容: {lines[1].strip()}")
-            except Exception as e:
-                logger.error(f"❌ 读取快手 cookies 文件失败: {e}")
-        else:
-            logger.warning(f"⚠️ 快手 cookies 文件不存在: {kuaishou_cookies_path}")
-    else:
-        logger.warning("⚠️ 未设置 KUAISHOU_COOKIES 环境变量")
-
-    # 确保下载目录存在
     download_path_obj = Path(download_path)
     download_path_obj.mkdir(parents=True, exist_ok=True)
-    
-    # 确保cookies目录存在
-    cookies_dir = Path(cookies_base_dir)
-    cookies_dir.mkdir(parents=True, exist_ok=True)
+    Path(cookies_base_dir).mkdir(parents=True, exist_ok=True)
+    (download_path_obj / "AppleMusic").mkdir(parents=True, exist_ok=True)
     logger.info(f"📁 确保cookies目录存在: {cookies_base_dir}")
-    
-    # 确保 AppleMusic 子目录存在
-    apple_music_path = download_path_obj / "AppleMusic"
-    apple_music_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"📁 确保下载目录存在: {download_path}")
-    logger.info(f"📁 确保 AppleMusic 子目录存在: {apple_music_path}")
-    
-    # 创建下载器和机器人
+
     downloader = VideoDownloader(
-        download_path, x_cookies_path, b_cookies_path, youtube_cookies_path, douyin_cookies_path, kuaishou_cookies_path, None, instagram_cookies_path
+        download_path,
+        x_cookies_path,
+        b_cookies_path,
+        youtube_cookies_path,
+        douyin_cookies_path,
+        kuaishou_cookies_path,
+        None,
+        instagram_cookies_path,
     )
-    bot = TelegramBot(bot_token, downloader)
 
-    # 将 bot 实例注册到 Flask 应用，供 Web 接口使用
-    app._bot_instance = bot
+    try:
+        from web_download_service import DownloadTaskManager
+        from web_api import create_web_download_blueprint
+    except ImportError as e:
+        logger.error(f"❌ 无法导入网页下载模块: {e}")
+        sys.exit(1)
 
-    # 在后台线程中启动 Flask 应用（仅用于 Telegram 会话生成）
+    task_manager = DownloadTaskManager(downloader)
+    task_manager.start()
+    app._task_manager = task_manager
+
+    static_dir = os.path.join(os.path.dirname(__file__), "web")
+    app.register_blueprint(
+        create_web_download_blueprint(
+            task_manager=task_manager,
+            auth_token=web_auth_token,
+            static_dir=static_dir,
+        )
+    )
+    logger.info("✅ 网页下载 API 已注册 (/ /api/parse /api/download /api/media-proxy /api/tasks)")
+
+    bot = None
+    if enable_telegram_bot:
+        bot = TelegramBot(bot_token, downloader)
+        app._bot_instance = bot
+        logger.info("✅ Telegram Bot 已初始化（可选启用）")
+    else:
+        app._bot_instance = None
+        logger.info("ℹ️ Telegram Bot 未启用（默认网页模式）。设置 enable_bot=true 或 ENABLE_TELEGRAM_BOT=true 可开启")
+
     def run_flask():
         try:
-            # 硬编码端口为8530
-            web_port = 8530
-
-            logger.info(f"🌐 启动内置Flask服务（仅用于 Telegram 会话生成）")
-            logger.info(f"   🔍 Web端口: {web_port} (包含 /setup)")
-
+            logger.info("🌐 启动 Flask 网页服务")
+            logger.info(f"   🔍 Web端口: {web_port} (/, /api/*, /setup)")
             app.run(host="0.0.0.0", port=web_port, debug=False, use_reloader=False)
         except Exception as e:
             logger.error(f"❌ Flask启动失败: {e}")
 
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info("✅ Flask Telegram 会话生成服务已启动")
+    logger.info(f"✅ 网页下载入口已启动: http://0.0.0.0:{web_port}/")
 
-    # 直接启动机器人
-    logger.info("🚀 启动Telegram Bot...")
-    await bot.run()
-    logger.info("✅ Telegram Bot启动成功！")
-
-    # ==================== B站收藏夹订阅功能 ====================
-
-
+    if enable_telegram_bot and bot is not None:
+        logger.info("🚀 启动 Telegram Bot...")
+        await bot.run()
+        logger.info("✅ Telegram Bot启动成功！")
+    else:
+        logger.info("🌐 网页模式运行中，按 Ctrl+C 退出")
+        stop_event = asyncio.Event()
+        try:
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            raise
 
 
 if __name__ == "__main__":
     try:
-        # 心跳更新已删除  # 初始化心跳
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("机器人已停止。")
+        logger.info("服务已停止。")
 
 
 

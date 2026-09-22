@@ -2,11 +2,18 @@
 # 创建文件时，若需要保留中文注释，请务必确保本文件编码为 UTF-8，否则会无法读取。
 
 [telegram]
-# Telegram Bot 配置
-telegram_bot_token = "xxx" # 核心配置，必选项，操作telegram机器人必须配置的参数
+# Telegram Bot 配置（默认关闭；网页入口为默认）
+enable_bot = false # true 时才启动 Telegram Bot；也可设环境变量 ENABLE_TELEGRAM_BOT=true
+telegram_bot_token = "xxx" # 仅当 enable_bot=true 时必填
 telegram_bot_api_id = "xxx" # 只有需要使用 telegram 保存视频才需要配置
 telegram_bot_api_hash = "xxx" # 只有需要使用 telegram 保存视频才需要配置
 telegram_bot_allowed_user_ids = "xxx" # 允许操作telegram机器人的telegram用户，不填写任何人只要知道你telegram机器人名称，都可以给你机器人发链接下载
+
+[web]
+# 网页下载入口（默认启用）
+# 访问 http://服务器:8530/ ，请求头 Authorization: Bearer <token>
+web_auth_token = "MyS3cret-Pass-2026" # 必填；也可用环境变量 WEB_AUTH_TOKEN
+# web_port = 8530
 
 [proxy]
 # 代理服务器配置

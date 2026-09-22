@@ -1,0 +1,24 @@
+services:
+  savextube:
+    build: .
+    image: savextube:web
+    container_name: savextube
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      # 可选：覆盖 toml 里的 token
+      # WEB_AUTH_TOKEN: "your-strong-token"
+      # 可选：启用 Telegram Bot
+      # ENABLE_TELEGRAM_BOT: "false"
+    ports:
+      - "8530:8530"
+    volumes:
+      # 下载目录（按服务器实际路径改左边）
+      - ./data/downloads:/downloads
+      # 配置文件目录：把 savextube.toml 放进 ./data/config/
+      - ./data/config:/app/config
+      # cookies（抖音/B站/YouTube 等）
+      - ./data/cookies:/app/cookies
+      # 日志 / 数据库
+      - ./data/logs:/app/logs
+      - ./data/db:/app/db
